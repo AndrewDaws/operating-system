@@ -2,6 +2,7 @@ name: Test HAOS image
 run-name: "Test HAOS ${{ inputs.version || format('(OS build #{0})', github.event.workflow_run.run_number) }}"
 
 on:
+  # Manual test of specified version
   workflow_dispatch:
     inputs:
       version:
@@ -9,23 +10,26 @@ on:
         required: true
         type: string
 
-  workflow_run:
-    workflows: ["OS build"]  # must be in sync with build workflow `name`
-    types:
-      - completed
+  # Called by other workflows (e.g. build.yaml)
+  workflow_call:
+    inputs:
+      use-artifact:
+        # Workaround for GH weirdness: https://github.com/actions/runner/discussions/1884
+        description: Download OS image using actions/download-artifact
+        required: false
+        type: boolean
+        default: true
+      version:
+        description: Version of HAOS to test (as used in the name of the qcow2 image artifact)
+        required: true
+        type: string
 
 jobs:
   test:
     if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
 
-    env:
-      NO_KVM: 1
-
     name: Test in QEMU
     runs-on: ubuntu-22.04
-    defaults:
-      run:
-        working-directory: ./tests
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -38,45 +42,50 @@ jobs:
           sudo apt install -y qemu-system-x86 ovmf
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: 3.12
 
       - name: Install Python requirements
         run:
-          pip install -r requirements.txt
+          pip install -r tests/requirements.txt
 
       - name: Download HAOS image
-        if: ${{ github.event_name == 'workflow_dispatch' }}
+        if: ${{ !inputs.use-artifact }}
         run: |
           curl -sfL -o haos.qcow2.xz  https://os-artifacts.home-assistant.io/${{github.event.inputs.version}}/haos_ova-${{github.event.inputs.version}}.qcow2.xz
 
       - name: Get OS image artifact
-        if: ${{ github.event_name == 'workflow_run' }}
-        uses: dawidd6/action-download-artifact@v2
+        if: ${{ inputs.use-artifact }}
+        uses: actions/download-artifact@v4
         with:
-          workflow: build.yaml
-          workflow_conclusion: success
-          name: ova-image
+          name: haos_ova-${{ inputs.version }}.qcow2.xz
 
       - name: Extract OS image
         run: |
-          xz -dc haos*.qcow2.xz > haos.qcow2
+          xz -dc haos*.qcow2.xz > tests/haos.qcow2
+          rm haos*.qcow2.xz
+
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
 
       - name: Run tests
         run: |
-          ./run_tests.sh
+          ./tests/run_tests.sh
 
       - name: Archive logs
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: logs
           path: |
-            tests/lg_logs/*
+            tests/lg_logs/**
 
       - name: Archive JUnit reports
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: junit_reports
@@ -84,7 +93,7 @@ jobs:
             tests/junit_reports/*.xml
 
       - name: Publish test report
-        uses: mikepenz/action-junit-report@v4
+        uses: mikepenz/action-junit-report@v5
         if: always()
         with:
           report_paths: 'tests/junit_reports/*.xml'
